@@ -1,10 +1,10 @@
-# 🤖 End-to-End Agentic RAG Application
+#  End-to-End Agentic RAG Application
 
 An end-to-end **Agentic Retrieval-Augmented Generation (RAG)** system integrated with an offline **Docling PDF Ingestion Pipeline** and a **Streamlit Web Interface**.
 
 ---
 
-## 🏗️ Architectural Overview & System Flow
+##  Architectural Overview & System Flow
 
 The system consists of **two main workflows**:
 
@@ -41,7 +41,7 @@ The system consists of **two main workflows**:
 
 ---
 
-## 📁 Directory Structure
+##  Directory Structure
 
 ```text
 c:\TASKS\T2\AgenticRAG\
