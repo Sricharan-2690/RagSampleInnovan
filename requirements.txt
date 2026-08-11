@@ -1,0 +1,29 @@
+# Parsing & Document Ingestion (Teammate's Pipeline)
+docling
+docling-core
+easyocr
+pypdf
+
+# Chunking & Embeddings
+transformers
+sentence-transformers
+fastembed
+
+# Vector Store
+qdrant-client
+
+# Agentic RAG & LangChain Framework
+langchain
+langchain-community
+langchain-core
+langchain-groq
+
+# External Tools & Math
+groq
+python-dotenv
+pydantic
+numexpr
+duckduckgo-search
+
+# Streamlit UI Frontend
+streamlit

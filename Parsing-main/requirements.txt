@@ -1,0 +1,18 @@
+# Parsing
+docling
+docling-core
+easyocr
+pypdf
+
+# Chunking / embeddings
+transformers
+sentence-transformers
+fastembed
+
+# Vector store
+qdrant-client
+
+# Retrieval / generation
+groq
+python-dotenv
+pydantic

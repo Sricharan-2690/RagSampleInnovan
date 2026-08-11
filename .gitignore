@@ -1,0 +1,32 @@
+# Environment & Secret files
+.env
+*.env
+!.env.example
+.env.*
+
+# Python Bytecode & Cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Virtual Environments
+venv/
+.venv/
+env/
+
+# Output & Intermediate Data
+output/
+Parsing-main/output/
+Parsing-main/input/*.pdf
+input/*.pdf
+*.pkl
+*.json
+*.md.tmp
+
+# IDE & OS Files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

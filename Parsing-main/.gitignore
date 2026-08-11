@@ -1,0 +1,24 @@
+# Secrets
+.env
+
+# Virtual environment
+venv/
+env/
+.venv/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Generated pipeline data (regenerate via pipeline.py — don't commit)
+input/*.pdf
+output/*
+!output/parsed/.gitkeep
+!output/chunks/.gitkeep
+
+# OS / editor
+.DS_Store
+.vscode/
+Thumbs.db
