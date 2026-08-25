@@ -11,7 +11,7 @@ Runs the full ingestion pipeline end-to-end for a single PDF:
 Each stage still writes its own intermediate pickle to disk (not just
 passed in-memory) — this keeps every stage independently re-runnable /
 debuggable, same as when you ran them as three separate scripts.
-p
+
 Querying/answering is NOT part of this pipeline — that's an ongoing,
 separate step handled by generate.py, which lets you interactively pick
 which ingested collection to ask questions against.
@@ -20,11 +20,20 @@ Usage:
     python pipeline.py
 """
 
+from dotenv import load_dotenv
+from langsmith import traceable
+
 from parse import run_parsing
 from chunking import run_chunking
 from store_qdrant import run_storage
 
+# -----------------------------
+# Load environment variables
+# -----------------------------
+load_dotenv()
 
+
+@traceable(run_type="chain", name="ingestion_pipeline")
 def run_pipeline():
     print("=" * 90)
     print("STAGE 1/3: PARSING")

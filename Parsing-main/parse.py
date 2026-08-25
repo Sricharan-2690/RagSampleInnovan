@@ -1,11 +1,6 @@
 """
 STEP 1: PARSING (LOCAL VERSION)
 --------------------------------
-Converted from the original Colab notebook (untitled0.py) to run locally
-in VS Code instead of Google Colab. Logic is unchanged; only the
-environment glue (Drive mount, !pip installs, hardcoded Drive paths) is
-replaced with local equivalents.
-
 Input  : first PDF found in ./input/
 Output : ./output/parsed/sample_doc.pkl   (docling Document object)
          ./output/parsed/result.md
@@ -18,6 +13,12 @@ Usage:
 
 NOTE: install dependencies first (see requirements.txt):
     pip install -r requirements.txt
+
+LangSmith Integration:
+    Set the following environment variables (or add to .env):
+        LANGSMITH_TRACING=true
+        LANGSMITH_API_KEY=<your_langsmith_api_key>
+        LANGSMITH_PROJECT=pdf-rag-pipeline
 """
 
 import os
@@ -30,6 +31,9 @@ os.environ["TORCHINDUCTOR_DISABLE"] = "1"
 import pickle
 from pathlib import Path
 
+from dotenv import load_dotenv
+from langsmith import traceable, trace
+
 from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling.datamodel.pipeline_options import (
     PdfPipelineOptions,
@@ -39,6 +43,11 @@ from docling.datamodel.pipeline_options import (
 )
 from docling.datamodel.base_models import InputFormat
 from docling_core.types.doc import ImageRefMode
+
+# -----------------------------
+# Load environment variables
+# -----------------------------
+load_dotenv()
 
 # -----------------------------
 # Paths
@@ -79,6 +88,7 @@ Return only the description.
 """
 
 
+@traceable(run_type="chain", name="find_input_pdf")
 def find_input_pdf(input_dir: Path = INPUT_DIR) -> Path:
     """Picks the PDF to parse from the input folder."""
     if not input_dir.exists():
@@ -117,6 +127,7 @@ def find_input_pdf(input_dir: Path = INPUT_DIR) -> Path:
     )
 
 
+@traceable(run_type="chain", name="build_converter")
 def build_converter(enable_vlm: bool = True) -> DocumentConverter:
     """Configures the docling pipeline: OCR, table structure extraction,
     and optional VLM-based picture description."""
@@ -136,8 +147,9 @@ def build_converter(enable_vlm: bool = True) -> DocumentConverter:
             options.picture_description_options = PictureDescriptionVlmOptions(
                 repo_id="Qwen/Qwen2.5-VL-3B-Instruct",
                 prompt=PICTURE_DESCRIPTION_PROMPT,
+                picture_area_threshold=0.05,  # default: 0.05 (5% of page area). Set to 0.0 to describe ALL images.
                 generation_config={
-                    "max_new_tokens": 128,
+                    "max_new_tokens": 256,
                     "do_sample": False,
                 },
             )
@@ -152,6 +164,7 @@ def build_converter(enable_vlm: bool = True) -> DocumentConverter:
     )
 
 
+@traceable(run_type="chain", name="run_parsing")
 def run_parsing(pdf_path: Path = None, output_dir: Path = OUTPUT_DIR):
     """Runs the full parsing pipeline on a single PDF and saves the results.
     Includes automatic fallback to standard layout parsing if VLM execution fails."""
@@ -160,28 +173,34 @@ def run_parsing(pdf_path: Path = None, output_dir: Path = OUTPUT_DIR):
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Parsing '{pdf_path}' ...")
+
+    # --- Build converter and run PDF conversion (traced) ---
     try:
         converter = build_converter(enable_vlm=True)
-        result = converter.convert(str(pdf_path))
+        with trace(name="pdf_conversion", run_type="chain", inputs={"pdf": str(pdf_path)}):
+            result = converter.convert(str(pdf_path))
     except Exception as e:
-        print(f"\n[Notice] VLM execution failed or missing MSVC compiler ({e}).")
-        print("Switching to standard high-accuracy layout & table parsing mode...")
+        print(f"\n[Notice] VLM execution failed ({e}). Switching to standard parsing...")
         converter = build_converter(enable_vlm=False)
-        result = converter.convert(str(pdf_path))
+        with trace(name="pdf_conversion_fallback", run_type="chain", inputs={"pdf": str(pdf_path)}):
+            result = converter.convert(str(pdf_path))
 
     document = result.document
 
+    # Print picture descriptions for visibility
     for pic in document.pictures:
         if pic.meta and pic.meta.description:
             print(pic.meta.description.text)
             print("---------")
 
-    pkl_path = output_dir / "sample_doc.pkl"
-    with open(pkl_path, "wb") as f:
-        pickle.dump(document, f)
+    # --- Save outputs (traced) ---
+    with trace(name="save_outputs", run_type="chain", inputs={"output_dir": str(output_dir)}):
+        pkl_path = output_dir / "sample_doc.pkl"
+        with open(pkl_path, "wb") as f:
+            pickle.dump(document, f)
 
-    document.save_as_markdown(output_dir / "result.md", image_mode=ImageRefMode.REFERENCED)
-    document.save_as_json(output_dir / "result.json")
+        document.save_as_markdown(output_dir / "result.md", image_mode=ImageRefMode.REFERENCED)
+        document.save_as_json(output_dir / "result.json")
 
     print(f"[SUCCESS] Saved parsed document to '{pkl_path}'.")
     return document
