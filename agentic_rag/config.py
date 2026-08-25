@@ -34,7 +34,7 @@ QDRANT_PORT = int(os.getenv("QDRANT_PORT", 6333))
 
 # LLM Parameters
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-DEFAULT_MODEL = "llama-3.3-70b-versatile"
+DEFAULT_MODEL = "openai/gpt-oss-120b"
 
 def get_qdrant_client() -> QdrantClient:
     """Returns a connected QdrantClient instance."""

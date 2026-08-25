@@ -25,5 +25,8 @@ pydantic
 numexpr
 duckduckgo-search
 
+# Observability & Tracing
+langsmith
+
 # Streamlit UI Frontend
 streamlit

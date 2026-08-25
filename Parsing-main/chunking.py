@@ -9,7 +9,7 @@ Input  : output/parsed/sample_doc.pkl   (docling Document object)
 Output : output/chunks/chunked_data.pkl (a dict with "documents" and "metadatas" lists)
 
 The tokenizer used to size chunks matches the tokenizer of the model
-actually used to embed chunks in store_qdrant.py / query.py (bge-small-en-v1.5),
+actually used to embed chunks in store_qdrant.py / query.py (bge-m3),
 so chunk sizes respect the real embedding model's token limit.
 
 Usage:
@@ -20,9 +20,17 @@ Usage:
 import pickle
 from pathlib import Path
 
+from dotenv import load_dotenv
+from langsmith import traceable, trace
+
 from docling_core.transforms.chunker.tokenizer.huggingface import HuggingFaceTokenizer
 from docling.chunking import HybridChunker
 from transformers import AutoTokenizer
+
+# -----------------------------
+# Load environment variables
+# -----------------------------
+load_dotenv()
 
 # -----------------------------
 # Paths
@@ -33,9 +41,10 @@ OUTPUT_PKL = OUTPUT_DIR / "chunked_data.pkl"
 
 # IMPORTANT: this must be the SAME model used for embedding in store_qdrant.py
 # and query.py, so chunk sizes line up with what the embedding model expects.
-EMBED_MODEL_ID = "BAAI/bge-small-en-v1.5"
+EMBED_MODEL_ID = "BAAI/bge-m3"
 
 
+@traceable(run_type="chain", name="build_chunker")
 def build_chunker() -> HybridChunker:
     """Sets up the HybridChunker with the embedding model's own tokenizer."""
     tokenizer = HuggingFaceTokenizer(
@@ -47,9 +56,6 @@ def build_chunker() -> HybridChunker:
         tokenizer=tokenizer,
         merge_peers=True,        # merge small neighboring chunks together
         merge_list_items=True,   # keep bullet-point lists together in one chunk
-        # NOTE: if your installed docling version raises a TypeError on
-        # `merge_list_items`, just remove this argument — older docling
-        # versions don't expose it and merge list items by default anyway.
     )
 
 
@@ -71,6 +77,7 @@ def slim_metadata(chunk):
     }
 
 
+@traceable(run_type="chain", name="run_chunking")
 def run_chunking(input_pkl: Path = INPUT_PKL, output_pkl: Path = OUTPUT_PKL):
     """Runs chunking on a parsed docling Document and saves the result.
 
@@ -94,29 +101,31 @@ def run_chunking(input_pkl: Path = INPUT_PKL, output_pkl: Path = OUTPUT_PKL):
             f"'{input_pkl}' not found. Run parse.py first (or pass its output path here)."
         )
 
-    with open(input_pkl, "rb") as f:
-        docs = pickle.load(f)
+    with trace(name="load_document", run_type="chain"):
+        with open(input_pkl, "rb") as f:
+            docs = pickle.load(f)
 
     chunker = build_chunker()
 
-    chunks = list(chunker.chunk(dl_doc=docs))
-    print(f"Total chunks created: {len(chunks)}")
+    with trace(name="chunking", run_type="chain"):
+        chunks = list(chunker.chunk(dl_doc=docs))
+        print(f"Total chunks created: {len(chunks)}")
 
-    documents = []   # the actual chunk text (with context prepended)
-    metadatas = []   # metadata dict per chunk
+        documents = []   # the actual chunk text (with context prepended)
+        metadatas = []   # metadata dict per chunk
 
-    for chunk in chunks:
-        # chunker.contextualize() adds the heading context on top of the raw text
-        documents.append(chunker.contextualize(chunk=chunk))
-        metadatas.append(slim_metadata(chunk))
+        for chunk in chunks:
+            documents.append(chunker.contextualize(chunk=chunk))
+            metadatas.append(slim_metadata(chunk))
 
     data = {
         "documents": documents,
         "metadatas": metadatas,
     }
 
-    with open(output_pkl, "wb") as f:
-        pickle.dump(data, f)
+    with trace(name="save_chunks", run_type="chain"):
+        with open(output_pkl, "wb") as f:
+            pickle.dump(data, f)
 
     print(f"Saved '{output_pkl}' with {len(documents)} chunks.")
     return data

@@ -25,14 +25,14 @@ from query import (
     ScopeTooBroadError,
 )
 import re
+from dotenv import load_dotenv
+from langsmith import traceable, trace
+
+load_dotenv()
 
 # -----------------------------
 # 0. Casual message detection
 # -----------------------------
-# Matches short greetings/small talk so we can skip retrieval ENTIRELY for
-# these — no point running Groq filter extraction + dense/sparse search +
-# cross-encoder reranking just to say "Hello!" back. This also means no
-# irrelevant "Sources used" list gets attached to a plain "Hi".
 CASUAL_PATTERN = re.compile(
     r"^(hi+|hello+|hey+|yo|sup|good\s*(morning|afternoon|evening|night)|"
     r"how are you( doing)?|what'?s up|thanks?( you)?|thank you|bye+|"
@@ -41,6 +41,7 @@ CASUAL_PATTERN = re.compile(
 )
 
 
+@traceable(run_type="chain", name="is_casual_message")
 def is_casual_message(query: str) -> bool:
     """Cheap, local check — no API call — for greeting/small-talk style messages."""
     return bool(CASUAL_PATTERN.match(query.strip()))
@@ -48,12 +49,6 @@ def is_casual_message(query: str) -> bool:
 # -----------------------------
 # 1. System prompt for grounded generation
 # -----------------------------
-# This is what keeps the LLM "honest" on real questions — without it, it'll
-# happily answer from its own training knowledge about the topic instead of
-# your document, which defeats the point of retrieval. At the same time, it
-# should still be able to handle plain conversational messages (greetings,
-# thanks, etc.) naturally instead of forcing those through the "only answer
-# from context" rule too.
 SYSTEM_PROMPT = """You are a helpful assistant for answering questions about a specific document.
 
 There are two kinds of messages you'll receive:
@@ -87,19 +82,15 @@ Decide which category the user's message falls into before answering.
 Never invent facts about the document that are not present in the context.
 """
 
-GENERATION_MODEL = "llama-3.3-70b-versatile"
+GENERATION_MODEL = "openai/gpt-oss-120b"
 
 
 # -----------------------------
 # 2. Build the context block from retrieved chunks
 # -----------------------------
+@traceable(run_type="chain", name="build_context")
 def build_context(scored_points) -> str:
-    """Formats the top reranked chunks into a single context string for the LLM.
-
-    Each chunk is tagged with its page number(s) so the LLM can cite them
-    in its answer. Expects (point, rerank_score) tuples, same shape
-    rerank_with_cross_encoder() returns.
-    """
+    """Formats the top reranked chunks into a single context string for the LLM."""
     blocks = []
     for i, (point, _rerank_score) in enumerate(scored_points, start=1):
         pages = point.payload.get("pages", [])
@@ -112,6 +103,7 @@ def build_context(scored_points) -> str:
 # -----------------------------
 # 3. Generate the final answer with Groq
 # -----------------------------
+@traceable(run_type="llm", name="generate_answer")
 def generate_answer(query: str, context: str) -> str:
     """Sends the retrieved context + user question to Groq and returns the answer."""
     response = groq_client.chat.completions.create(
@@ -120,15 +112,12 @@ def generate_answer(query: str, context: str) -> str:
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {query}"},
         ],
-        temperature=0.2,  # low temperature: favor grounded, consistent answers over creativity
-        max_tokens=1024,  # explicit cap, well above what a normal answer needs
+        temperature=0.2,
+        max_tokens=1024,
     )
 
     choice = response.choices[0]
     if choice.finish_reason == "length":
-        # The model got cut off before finishing — this is what actual
-        # truncation looks like (not the "=" * 90 divider in print_answer,
-        # which is just decorative and prints the full string regardless).
         print("[WARNING] Response was cut off (finish_reason='length'). "
               "Consider raising max_tokens further if this keeps happening.")
 
@@ -138,32 +127,14 @@ def generate_answer(query: str, context: str) -> str:
 # -----------------------------
 # 4. Full pipeline: retrieve -> rerank -> generate
 # -----------------------------
+@traceable(run_type="chain", name="rag_pipeline")
 def answer_question(query: str, collection_name: str, top_k: int = 5) -> dict:
-    """Runs the full RAG pipeline for one question.
-
-    Casual/small-talk messages skip retrieval entirely and go straight to
-    the LLM with no context — no point spending a Groq filter-extraction
-    call + dense/sparse search + reranking just to say "Hello!" back, and
-    it keeps irrelevant chunks from showing up as "Sources" on a greeting.
-
-    For questions with an EXPLICIT SCOPE (specific page(s) or filename),
-    search_hybrid() fetches ALL matching chunks instead of a fixed top_k —
-    the user already told us the scope, so nothing in it should be silently
-    dropped. In that case top_k is ignored entirely and every matching
-    chunk is sent to the LLM (still cross-encoder ordered for readability).
-    If that scope is unreasonably broad (see FILTERED_FETCH_CAP in
-    query.py), we ask the user to narrow it rather than sending an
-    oversized request.
-
-    Returns a dict: {"answer": str, "sources": list of (chunk_index, pages)}
-    """
+    """Runs the full RAG pipeline for one question."""
     if is_casual_message(query):
         answer = generate_answer(query, context="")
         return {"answer": answer, "sources": []}
 
     try:
-        # Stage 1: retrieval — explicit scope fetches ALL matching chunks;
-        # open-ended questions get dense + sparse + RRF -> wide pool.
         candidates, _dense_only, _sparse_only, is_filtered = search_hybrid(
             query=query,
             collection_name=collection_name,
@@ -172,8 +143,6 @@ def answer_question(query: str, collection_name: str, top_k: int = 5) -> dict:
     except ScopeTooBroadError as e:
         return {"answer": str(e), "sources": []}
 
-    # Stage 2: cross-encoder orders the candidates. Explicit scope -> keep
-    # ALL of them (top_k=None); open-ended -> truncate to top_k as before.
     final_results = rerank_with_cross_encoder(
         query=query,
         candidates=candidates,
@@ -186,7 +155,6 @@ def answer_question(query: str, collection_name: str, top_k: int = 5) -> dict:
             "sources": [],
         }
 
-    # Stage 3: build grounded context and generate the answer
     context = build_context(final_results)
     answer = generate_answer(query, context)
 
@@ -212,9 +180,6 @@ def print_answer(result: dict):
             print(f"  Chunk {chunk_idx} -> Pages {pages}")
 
 
-# Phrases that end the chat loop (checked case-insensitively, exact match
-# after stripping whitespace — so "bye" ends it, but "bye bye buddy" doesn't
-# accidentally match too, keeping this predictable).
 EXIT_WORDS = {"exit", "bye", "done", "quit"}
 
 
@@ -227,7 +192,7 @@ if __name__ == "__main__":
         user_query = input("Enter your question: ").strip()
 
         if not user_query:
-            continue  # ignore empty input, ask again
+            continue
 
         if user_query.lower() in EXIT_WORDS:
             print("Goodbye!")

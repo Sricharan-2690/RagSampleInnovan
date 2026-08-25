@@ -2,37 +2,23 @@
 STEP 4: HYBRID QUERY WITH EXPLICIT COLLECTION SELECTION
 -------------------------------------------------------
 - Accepts explicit 'collection_name' from caller (UI/API/CLI).
-- Uses Groq API (Llama 3.3 70B) to parse metadata pre-filters (pages, labels).
-- Executes a single fused Dense (bge-small) + Sparse (BM25) hybrid search
+- Uses Groq API to parse metadata pre-filters (pages, labels).
+- Executes a single fused Dense (bge-m3) + Sparse (BM25) hybrid search
   over the target collection, combined server-side via Qdrant's RRF fusion.
+- Cross-encoder reranking stage for precision ordering.
 
-FIXED:
-1. Dense and sparse results are no longer returned/printed as two separate,
-   unrelated lists. They're now combined with Qdrant's native RRF
-   (Reciprocal Rank Fusion) via `prefetch` + `FusionQuery`, so you get one
-   ranked hybrid result list — which is what "hybrid search" is supposed
-   to mean. (Real BM25 scoring on the sparse side only works correctly
-   because store_qdrant.py now sets `modifier=Modifier.IDF` on the
-   collection — see that file.)
-2. bge-small-en-v1.5 is an asymmetric embedding model: it expects queries
-   to be prefixed with an instruction string for best retrieval quality.
-   Document embeddings (in store_qdrant.py) are left as-is; only the query
-   text gets the prefix.
-3. Added a cross-encoder reranking stage. RRF fusion now pulls a WIDE
-   candidate pool (RRF_CANDIDATE_POOL = 25) instead of directly returning
-   only 5 results. A cross-encoder then reads (query, chunk_text) together
-   for all 25 candidates and re-scores them for true relevance, and only
-   THEN do we cut down to the final top_k (5). Feeding a cross-encoder
-   only 5 pre-cut candidates would defeat the purpose — it can only
-   re-sort what it's given, so RRF's rough ranking would have already
-   thrown away anything ranked 6th or worse before the more accurate
-   model got a chance to look at it.
+Key changes from original:
+1. Switched to bge-m3 (1024 dim) for dense embeddings.
+2. Labels metadata filter now supports List[str] (multiple labels).
+3. LangSmith tracing on all functions.
+4. Model updated from deprecated llama-3.3-70b-versatile to openai/gpt-oss-120b.
 """
 
 import sys
 from typing import Optional, List
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
+from langsmith import traceable, trace
 from groq import Groq
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from fastembed import SparseTextEmbedding
@@ -55,25 +41,17 @@ load_dotenv()
 # 1. Initialize Models & Clients
 # -----------------------------
 print("Loading retrieval models...")
-dense_model = SentenceTransformer("BAAI/bge-small-en-v1.5")
+dense_model = SentenceTransformer("BAAI/bge-m3")
 sparse_model = SparseTextEmbedding(model_name="Qdrant/bm25")
 cross_encoder = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 
-# bge-small-en-v1.5 is asymmetric: queries need this instruction prefix,
-# document/passage embeddings do NOT (store_qdrant.py embeds docs as-is).
-BGE_QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
+# bge-m3 is symmetric: no instruction prefix needed for queries.
+BGE_QUERY_PREFIX = ""
 
 # How many candidates RRF fusion should surface BEFORE reranking.
-# This must be wider than the final top_k so the cross-encoder has real
-# options to re-sort, not just 5 pre-decided results to shuffle.
 RRF_CANDIDATE_POOL = 25
 
-# Safety cap for the "fetch ALL chunks matching an explicit filter" path
-# (used when the user names specific pages/a filename — see fetch_all_filtered_chunks).
-# This is NOT a normal working limit — a real page/page-range question will
-# land nowhere near it. It only exists to fail predictably (ask the user to
-# narrow scope) instead of silently sending a huge, expensive request if a
-# filter ever matches an unexpectedly large number of chunks.
+# Safety cap for the filter-only fetch path.
 FILTERED_FETCH_CAP = 100
 
 client = QdrantClient(host="localhost", port=6333)
@@ -81,10 +59,7 @@ groq_client = Groq()
 
 
 class ScopeTooBroadError(Exception):
-    """Raised when an explicit filter (page_nos/filename) matches more than
-    FILTERED_FETCH_CAP chunks. Callers should catch this and ask the user
-    to narrow their question, rather than silently truncating or sending
-    an oversized request to the LLM."""
+    """Raised when an explicit filter matches more than FILTERED_FETCH_CAP chunks."""
     pass
 
 # -----------------------------
@@ -95,69 +70,72 @@ class ExtractedMetadata(BaseModel):
         default=None,
         description="Page number(s) explicitly mentioned in query, as a list (e.g., [4], [5, 6])"
     )
-    label: Optional[str] = Field(
-        default=None, 
-        description="Content label if specifically requested: 'text', 'section_header', 'table', 'list_item'"
+    labels: Optional[List[str]] = Field(
+        default=None,
+        description="Content labels if specifically requested: 'text', 'section_header', 'table', 'list_item', 'picture'"
     )
     filename: Optional[str] = Field(
-        default=None, 
+        default=None,
         description="Filename if explicitly mentioned in query"
     )
 
 # -----------------------------
 # 3. Dynamic Metadata Extractor
 # -----------------------------
+@traceable(run_type="chain", name="extract_metadata_filters")
 def extract_metadata_filters(query: str) -> ExtractedMetadata:
-    """Uses Groq Llama 3 to parse intent and extract metadata criteria as JSON."""
+    """Uses Groq LLM to parse intent and extract metadata criteria as JSON."""
     prompt = f"""You are a query parser for a database. Analyze the query and extract metadata filters.
-Available content labels: 'text', 'section_header', 'table', 'list_item', 'page_header', 'page_footer'.
-- If the user asks for tables, set "label": "table".
+Available content labels: 'text', 'section_header', 'table', 'list_item', 'picture', 'page_header', 'page_footer'.
+- If the user asks for tables, set "labels": ["table"].
+- If the user asks for multiple types (e.g. tables and pictures), set "labels": ["table", "picture"].
 - If one or more page numbers are mentioned, set "page_nos" to a list of ALL
   of them (e.g. "page 5" -> [5], "page 5 and 6" -> [5, 6], "pages 3, 4, 7" -> [3, 4, 7]).
-- If no specific page, label, or filename is requested, set their values to null.
+- If no specific page, labels, or filename is requested, set their values to null.
 
 Return ONLY a JSON object matching this schema:
 {{
   "page_nos": array of integers or null,
-  "label": string or null,
+  "labels": array of strings or null,
   "filename": string or null
 }}
 
 Query: "{query}" """
 
     response = groq_client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
+        model="openai/gpt-oss-120b",
         messages=[{"role": "user", "content": prompt}],
         response_format={"type": "json_object"},
         temperature=0.0
     )
-    
+
     raw_json = response.choices[0].message.content
     return ExtractedMetadata.model_validate_json(raw_json)
 
 
+@traceable(run_type="chain", name="build_qdrant_filter")
 def build_qdrant_filter(extracted: ExtractedMetadata) -> Filter:
     """Translates extracted metadata into a Qdrant Filter object."""
     must_conditions = []
-    
+
     if extracted.page_nos:
-        # MatchAny: matches a chunk if ITS "pages" array contains ANY of the
-        # requested page numbers — this is what makes "page 5 and 6" actually
-        # search both pages, instead of only the first one found.
         must_conditions.append(
             FieldCondition(key="pages", match=MatchAny(any=extracted.page_nos))
         )
-    if extracted.label is not None:
+    if extracted.labels is not None:
         must_conditions.append(
-            FieldCondition(key="labels", match=MatchValue(value=extracted.label))
+            FieldCondition(key="labels", match=MatchAny(any=extracted.labels))
         )
     if extracted.filename is not None:
         must_conditions.append(
             FieldCondition(key="filename", match=MatchValue(value=extracted.filename))
         )
 
+    # Exclude headers/footers unless the user specifically asked for them
     must_not_conditions = []
-    if extracted.label not in ["page_header", "page_footer"]:
+    excluded_labels = {"page_header", "page_footer"}
+    requested_labels = set(extracted.labels) if extracted.labels else set()
+    if not requested_labels.intersection(excluded_labels):
         must_not_conditions.extend([
             FieldCondition(key="labels", match=MatchValue(value="page_header")),
             FieldCondition(key="labels", match=MatchValue(value="page_footer")),
@@ -170,24 +148,15 @@ def build_qdrant_filter(extracted: ExtractedMetadata) -> Filter:
 
 
 # -----------------------------
-# 3b. Filter-Only Fetch (for explicit page/filename scope — no vector search)
+# 3b. Filter-Only Fetch (for explicit page/filename scope)
 # -----------------------------
+@traceable(run_type="chain", name="fetch_all_filtered_chunks")
 def fetch_all_filtered_chunks(collection_name: str, qdrant_filter: Filter, cap: int = FILTERED_FETCH_CAP):
-    """Fetches ALL chunks matching an explicit filter, using Qdrant's scroll
-    API — this is a plain filter lookup, NOT a semantic/keyword search, so
-    no embeddings are computed for this path at all.
-
-    Use this when the user names an explicit scope (specific page(s) or a
-    filename) — they've already told us exactly what's in scope, so nothing
-    that matches should be silently dropped the way a fixed top_k would.
-
-    Raises ScopeTooBroadError if more than `cap` chunks match — this is a
-    safety guardrail, not a normal-case limit (see FILTERED_FETCH_CAP).
-    """
+    """Fetches ALL chunks matching an explicit filter via Qdrant's scroll API."""
     points, _next_offset = client.scroll(
         collection_name=collection_name,
         scroll_filter=qdrant_filter,
-        limit=cap + 1,  # +1 lets us detect ">cap matches" in a single call
+        limit=cap + 1,
         with_payload=True,
         with_vectors=False,
     )
@@ -204,42 +173,23 @@ def fetch_all_filtered_chunks(collection_name: str, qdrant_filter: Filter, cap: 
 # -----------------------------
 # 4. Search Execution Engine (fused hybrid search)
 # -----------------------------
+@traceable(run_type="retriever", name="search_hybrid")
 def search_hybrid(query: str, collection_name: str, candidate_pool: int = RRF_CANDIDATE_POOL, prefetch_limit: int = 40, debug_top_k: int = 5):
     """Runs retrieval for a query, choosing one of two strategies:
 
     - EXPLICIT SCOPE (page_nos and/or filename given): skips vector search
-      entirely and fetches ALL chunks matching that filter via Qdrant scroll
-      (see fetch_all_filtered_chunks). The user already told us the exact
-      scope — a fixed top_k would silently drop chunks that belong there.
+      entirely and fetches ALL chunks matching that filter via Qdrant scroll.
     - NO EXPLICIT SCOPE (open-ended question): dense + sparse search fused
-      with RRF, as before — this is genuine "find the most relevant chunks
-      out of the whole collection" search, where a relevance cutoff makes sense.
+      with RRF.
 
     Returns a tuple: (candidates, dense_only_results, sparse_only_results, is_filtered)
-    - candidates: either ALL filtered chunks (explicit-scope path) or the
-      WIDE RRF-fused candidate_pool (semantic path) — either way, meant to
-      be fed into rerank_with_cross_encoder() next, NOT the final answer.
-    - dense_only_results / sparse_only_results: debug-only, top `debug_top_k`
-      from each branch individually. Empty lists on the explicit-scope path,
-      since no vector search runs there at all.
-    - is_filtered: True if the explicit-scope path was used. Callers should
-      use this to avoid re-truncating an already-exact scope down to a
-      small top_k during reranking.
-
-    Raises ScopeTooBroadError if an explicit filter matches too many chunks
-    (see FILTERED_FETCH_CAP) — callers should catch this and ask the user
-    to narrow their question.
     """
-    
+
     # Check if target collection exists
     if not client.collection_exists(collection_name):
         raise ValueError(f"Collection '{collection_name}' does not exist in Qdrant!")
 
-    # Check the collection actually has the "dense" and "sparse" named vectors
-    # this pipeline expects. Without this, Qdrant fails with a raw 400 error
-    # ("Not existing vector name error: dense") that doesn't tell you WHY —
-    # usually it means you picked a stale/incompatible collection (e.g. one
-    # built before this pipeline's schema, or by a different script).
+    # Validate collection schema
     collection_info = client.get_collection(collection_name)
     existing_vectors = set(collection_info.config.params.vectors.keys())
     required_vectors = {"dense"}
@@ -255,73 +205,71 @@ def search_hybrid(query: str, collection_name: str, candidate_pool: int = RRF_CA
     # A. Extract query metadata pre-filters
     extracted_meta = extract_metadata_filters(query)
     print(f"\n[Groq Extracted Filters]: {extracted_meta.model_dump_json(exclude_none=True)}")
-    
+
     # B. Build Qdrant filter
     qdrant_filter = build_qdrant_filter(extracted_meta)
 
-    # ---- BRANCH: explicit scope given -> fetch ALL matching chunks, skip vector search ----
+    # ---- BRANCH: explicit scope given -> fetch ALL matching chunks ----
     has_explicit_scope = bool(extracted_meta.page_nos) or bool(extracted_meta.filename)
     if has_explicit_scope:
         all_filtered = fetch_all_filtered_chunks(collection_name, qdrant_filter)
         return all_filtered, [], [], True
 
-    # ---- BRANCH: no explicit scope -> existing semantic dense+sparse+RRF search ----
+    # ---- BRANCH: no explicit scope -> semantic dense+sparse+RRF search ----
     # C. Embed query text into dense and sparse spaces
-    dense_vec = dense_model.encode(
-        BGE_QUERY_PREFIX + query,
-        normalize_embeddings=True,
-    ).tolist()
-    sparse_vec = list(sparse_model.embed([query]))[0]
-    sparse_query = SparseVector(
-        indices=sparse_vec.indices.tolist(),
-        values=sparse_vec.values.tolist(),
-    )
+    with trace(name="query_embedding", run_type="chain"):
+        dense_vec = dense_model.encode(
+            BGE_QUERY_PREFIX + query,
+            normalize_embeddings=True,
+        ).tolist()
+        sparse_vec = list(sparse_model.embed([query]))[0]
+        sparse_query = SparseVector(
+            indices=sparse_vec.indices.tolist(),
+            values=sparse_vec.values.tolist(),
+        )
 
-    # D. Fused hybrid search: prefetch dense + sparse candidates, then
-    #    combine them server-side with Reciprocal Rank Fusion (RRF).
-    #    NOTE: limit=candidate_pool (25), not the final top_k — we deliberately
-    #    keep this pool wide so the cross-encoder has real material to rerank.
-    fused_results = client.query_points(
-        collection_name=collection_name,
-        prefetch=[
-            Prefetch(
-                query=dense_vec,
-                using="dense",
-                filter=qdrant_filter,
-                limit=prefetch_limit,
-            ),
-            Prefetch(
-                query=sparse_query,
-                using="sparse",
-                filter=qdrant_filter,
-                limit=prefetch_limit,
-            ),
-        ],
-        query=FusionQuery(fusion=Fusion.RRF),
-        limit=candidate_pool,
-        with_payload=True,
-    ).points
+    # D. Fused hybrid search via RRF
+    with trace(name="rrf_fusion_search", run_type="chain"):
+        fused_results = client.query_points(
+            collection_name=collection_name,
+            prefetch=[
+                Prefetch(
+                    query=dense_vec,
+                    using="dense",
+                    filter=qdrant_filter,
+                    limit=prefetch_limit,
+                ),
+                Prefetch(
+                    query=sparse_query,
+                    using="sparse",
+                    filter=qdrant_filter,
+                    limit=prefetch_limit,
+                ),
+            ],
+            query=FusionQuery(fusion=Fusion.RRF),
+            limit=candidate_pool,
+            with_payload=True,
+        ).points
 
-    # E. Standalone dense-only and sparse-only searches, purely for visibility
-    #    into what each retrieval method finds on its own. These do NOT feed
-    #    into the fusion/reranking pipeline above — they're just for printing.
-    dense_only_results = client.query_points(
-        collection_name=collection_name,
-        query=dense_vec,
-        using="dense",
-        query_filter=qdrant_filter,
-        with_payload=True,
-        limit=debug_top_k,
-    ).points
+    # E. Standalone searches for debug visibility
+    with trace(name="debug_individual_searches", run_type="chain"):
+        dense_only_results = client.query_points(
+            collection_name=collection_name,
+            query=dense_vec,
+            using="dense",
+            query_filter=qdrant_filter,
+            with_payload=True,
+            limit=debug_top_k,
+        ).points
 
-    sparse_only_results = client.query_points(
-        collection_name=collection_name,
-        query=sparse_query,
-        using="sparse",
-        query_filter=qdrant_filter,
-        with_payload=True,
-        limit=debug_top_k,
-    ).points
+        sparse_only_results = client.query_points(
+            collection_name=collection_name,
+            query=sparse_query,
+            using="sparse",
+            query_filter=qdrant_filter,
+            with_payload=True,
+            limit=debug_top_k,
+        ).points
 
     return fused_results, dense_only_results, sparse_only_results, False
 
@@ -329,31 +277,9 @@ def search_hybrid(query: str, collection_name: str, candidate_pool: int = RRF_CA
 # -----------------------------
 # 4b. Cross-Encoder Reranking Stage
 # -----------------------------
+@traceable(run_type="chain", name="rerank_with_cross_encoder")
 def rerank_with_cross_encoder(query: str, candidates, top_k: Optional[int] = 5):
-    """Re-scores candidates with a cross-encoder for true relevance ordering.
-
-    Unlike the bi-encoder (dense_model), which embeds the query and each
-    chunk SEPARATELY and compares vectors, a cross-encoder reads the query
-    and chunk TOGETHER in a single forward pass — much more accurate at
-    judging "does this chunk really answer this query", but too slow to
-    run over an entire collection, which is why it's only used to rerank
-    a shortlist rather than the whole corpus.
-
-    Pass top_k=None to keep ALL candidates, just reordered by relevance —
-    use this for the explicit-scope (filtered) retrieval path, where the
-    user already defined the exact scope and truncation would silently
-    drop chunks that belong there. Pass a number (default 5) to truncate,
-    for the open-ended semantic search path.
-
-    Returns a list of (point, rerank_score) tuples, sorted by rerank_score
-    descending, truncated to top_k (or all of them, if top_k is None).
-
-    NOTE: qdrant_client's ScoredPoint is a Pydantic model, which does NOT
-    allow setting arbitrary new attributes on an instance (e.g.
-    `point.rerank_score = x` raises ValueError: "ScoredPoint" object has
-    no field "rerank_score"). So instead of mutating the point, we keep
-    the point and its cross-encoder score as a separate (point, score) pair.
-    """
+    """Re-scores candidates with a cross-encoder for true relevance ordering."""
     if not candidates:
         return []
 
@@ -366,13 +292,7 @@ def rerank_with_cross_encoder(query: str, candidates, top_k: Optional[int] = 5):
 
 
 def print_retrieval_breakdown(dense_points, sparse_points):
-    """Pretty-print the standalone dense-only and sparse-only results.
-
-    Purely informational — shows what each retrieval method found
-    independently, before RRF fusion and cross-encoder reranking touch them.
-    Empty on the explicit-scope (filtered) retrieval path, since no vector
-    search runs there at all.
-    """
+    """Pretty-print standalone dense-only and sparse-only results (debug)."""
     print("\n" + "=" * 90)
     print("--- [DEBUG] DENSE-ONLY RESULTS (Semantic / Cosine Similarity) ---")
     print("=" * 90)
@@ -389,14 +309,7 @@ def print_retrieval_breakdown(dense_points, sparse_points):
 
 
 def print_search_results(scored_points, is_filtered: bool = False):
-    """Pretty-print final, cross-encoder-reranked search results.
-
-    Expects a list of (point, rerank_score) tuples, as returned by
-    rerank_with_cross_encoder(). On the explicit-scope (filtered) path,
-    points come from Qdrant's scroll() and have no similarity `.score`
-    (they were fetched by exact filter match, not ranked search) — so
-    that column is skipped there instead of erroring.
-    """
+    """Pretty-print final cross-encoder-reranked results."""
     print("\n" + "=" * 90)
     header = "--- FINAL RESULTS (Explicit scope: all matching chunks, cross-encoder ordered) ---" \
         if is_filtered else \
@@ -415,14 +328,7 @@ def print_search_results(scored_points, is_filtered: bool = False):
 # 5. CLI Collection Selection Helper
 # -----------------------------
 def get_user_selected_collection() -> str:
-    """Helper for local testing: Lists collections and gets explicit user choice.
-
-    Accepts either the list index (e.g. "2") OR the collection name typed
-    directly (e.g. "sample"). Previously, typing a name here silently fell
-    through to available_names[0] with no warning — you could end up
-    querying a completely different (and possibly schema-incompatible)
-    collection than the one you intended.
-    """
+    """Helper for local testing: Lists collections and gets explicit user choice."""
     collections = client.get_collections().collections
     if not collections:
         print("[ERROR] No collections found in Qdrant! Please run store_qdrant.py first.")
@@ -440,31 +346,25 @@ def get_user_selected_collection() -> str:
 
     selection = input(f"\nSelect PDF collection (1-{len(available_names)} or type the name): ").strip()
 
-    # Numeric index
     if selection.isdigit() and 1 <= int(selection) <= len(available_names):
         return available_names[int(selection) - 1]
 
-    # Typed name (case-insensitive exact match)
     for name in available_names:
         if name.lower() == selection.lower():
             return name
 
-    # Nothing matched — fail loudly instead of silently picking available_names[0]
     print(f"[ERROR] '{selection}' is not a valid index or collection name. "
           f"Valid options: {available_names}")
     sys.exit(1)
 
 
 if __name__ == "__main__":
-    # Explicit collection selection (Simulates UI/frontend active document selection)
     target_collection = get_user_selected_collection()
     print(f"\nActive Target Collection: '{target_collection}'")
 
     user_query = input("Enter search query: ")
 
     try:
-        # Stage 1 (recall-focused): either fetch-all-by-filter (explicit scope)
-        # or dense + sparse + RRF -> wide candidate pool (open-ended question)
         candidates, dense_only, sparse_only, is_filtered = search_hybrid(
             query=user_query,
             collection_name=target_collection,
@@ -477,8 +377,6 @@ if __name__ == "__main__":
 
     print_retrieval_breakdown(dense_only, sparse_only)
 
-    # Stage 2 (precision-focused): cross-encoder orders the candidates.
-    # Explicit scope -> keep ALL of them (top_k=None); open-ended -> top 5.
     final_results = rerank_with_cross_encoder(
         query=user_query,
         candidates=candidates,
