@@ -135,7 +135,22 @@ c:\TASKS\T2\AgenticRAG\
 
 ---
 
-## 🚀 How to Run the Application
+## � Recent Changes
+
+### LangSmith Tracing Reliability
+* **Trace flush on ingestion**: Added `Client().flush()` at the end of both `ingest_uploaded_pdf()` and `ingest_local_pdf()` in `agentic_rag/ingest_adapter.py`. The LangSmith SDK sends trace events asynchronously in a background thread; when the ingestion process finished (or Streamlit re-ran) before the batch was flushed, the "run ended" event was never delivered and runs appeared stuck "running" (spinning) in the LangSmith dashboard. Flushing forces all pending trace events to be sent before the function returns, so runs close out with a final status. The call is wrapped in a `try/except` so a flush failure never breaks ingestion.
+
+### Retrieval
+* **`Parsing-main/query.py`**: Minor formatting cleanup in the `search_hybrid()` collection-validation block (no behavioral change).
+
+### Documentation
+* **`models_summary.txt`**: Added a complete inventory of every model used across the ingestion and retrieval pipelines — embedding model (`BAAI/bge-m3`, 1024-dim, COSINE), sparse `Qdrant/bm25` (IDF), cross-encoder reranker (`ms-marco-MiniLM-L-6-v2`), VLM (`Qwen2.5-VL-3B-Instruct`), EasyOCR, TableFormer, and the `openai/gpt-oss-120b` LLM — along with sizes, vector dimensions, distance metrics, and Qdrant configuration.
+
+> Note: the current pipeline uses `BAAI/bge-m3` (1024-dim dense vectors) and `openai/gpt-oss-120b`. Some older sections of this README still reference `bge-small` (384-dim) and `llama-3.3-70b`; see `models_summary.txt` for the authoritative, up-to-date list.
+
+---
+
+## �🚀 How to Run the Application
 
 ### 1. Prerequisites
 Ensure Docker is running and launch Qdrant:

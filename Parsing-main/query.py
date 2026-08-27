@@ -193,6 +193,7 @@ def search_hybrid(query: str, collection_name: str, candidate_pool: int = RRF_CA
     collection_info = client.get_collection(collection_name)
     existing_vectors = set(collection_info.config.params.vectors.keys())
     required_vectors = {"dense"}
+    
     existing_sparse = set(collection_info.config.params.sparse_vectors.keys()) if collection_info.config.params.sparse_vectors else set()
     if not required_vectors.issubset(existing_vectors) or "sparse" not in existing_sparse:
         raise ValueError(
