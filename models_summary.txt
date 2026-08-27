@@ -1,0 +1,199 @@
+================================================================================
+              MODELS USED IN RAG PIPELINE - COMPLETE SUMMARY
+================================================================================
+
+Project: RagSampleInnovan (Agentic RAG with Hybrid Search)
+
+================================================================================
+                         INGESTION PIPELINE MODELS
+================================================================================
+
+1. Qwen/Qwen2.5-VL-3B-Instruct (Vision-Language Model)
+--------------------------------------------------------------------------------
+   Purpose       : Generates text descriptions of images/charts/figures in PDFs
+   Size          : 3 Billion parameters
+   Type          : Vision-Language Model (VLM)
+   Used in       : parse.py (Docling PDF parsing stage)
+   Configuration :
+     - max_new_tokens     : 256
+     - do_sample          : False (deterministic greedy decoding)
+     - picture_area_threshold : 0.05 (describes images >= 5% of page area)
+   Notes         : Falls back to standard parsing if VLM fails
+
+2. EasyOCR (Optical Character Recognition)
+--------------------------------------------------------------------------------
+   Purpose       : Extracts text from scanned/image-based PDF regions
+   Size          : Lightweight (CRAFT detection + CRNN recognition)
+   Type          : OCR Engine
+   Used in       : parse.py (Docling PDF parsing stage)
+   Configuration :
+     - Languages          : ["en"] (English)
+     - force_full_page_ocr: False (only OCRs regions that need it)
+
+3. TableFormer (Table Structure Extraction)
+--------------------------------------------------------------------------------
+   Purpose       : Extracts table structure from PDF pages
+   Size          : Built-in Docling model
+   Type          : Table structure recognition
+   Used in       : parse.py (Docling PDF parsing stage)
+   Configuration :
+     - Mode               : ACCURATE (higher quality, slower)
+     - do_cell_matching   : True
+
+4. BAAI/bge-m3 (Dense Embedding Model - Indexing)
+--------------------------------------------------------------------------------
+   Purpose       : Generates dense vector embeddings for document chunks
+   Size          : ~568M parameters
+   Type          : Bi-encoder (Sentence Transformer)
+   Vector Dim    : 1024
+   Used in       : store_qdrant.py (embedding generation at index time)
+                   chunking.py (tokenizer used to set chunk size limits)
+   Configuration :
+     - normalize_embeddings : True
+     - Distance metric      : COSINE (in Qdrant)
+     - Tokenizer max_tokens : 512 (for chunking)
+
+5. Qdrant/bm25 (Sparse Embedding Model - Indexing)
+--------------------------------------------------------------------------------
+   Purpose       : Generates sparse BM25-style keyword vectors
+   Size          : Lightweight statistical model (not a neural network)
+   Type          : Sparse text embedding (FastEmbed)
+   Vector Dim    : Variable (sparse index/value pairs, no fixed dimension)
+   Used in       : store_qdrant.py (sparse embedding at index time)
+   Configuration :
+     - Modifier            : IDF (required for correct BM25 scoring)
+
+
+================================================================================
+                         RETRIEVAL PIPELINE MODELS
+================================================================================
+
+6. BAAI/bge-m3 (Dense Embedding Model - Query)
+--------------------------------------------------------------------------------
+   Purpose       : Encodes user queries into dense vectors for similarity search
+   Size          : ~568M parameters (same model as indexing)
+   Type          : Bi-encoder (Sentence Transformer)
+   Vector Dim    : 1024
+   Used in       : query.py (query-time dense encoding)
+   Configuration :
+     - normalize_embeddings : True
+     - Query prefix         : "" (symmetric model, no prefix needed)
+
+7. Qdrant/bm25 (Sparse Embedding Model - Query)
+--------------------------------------------------------------------------------
+   Purpose       : Encodes user queries into sparse vectors for keyword matching
+   Size          : Lightweight statistical model (same as indexing)
+   Type          : Sparse text embedding (FastEmbed)
+   Vector Dim    : Variable (sparse)
+   Used in       : query.py (query-time sparse encoding)
+
+8. cross-encoder/ms-marco-MiniLM-L-6-v2 (Reranker)
+--------------------------------------------------------------------------------
+   Purpose       : Reranks candidate results for precision ordering
+   Size          : ~22M parameters (6-layer distilled MiniLM)
+   Type          : Cross-encoder
+   Used in       : query.py (reranking after hybrid search fusion)
+   Configuration :
+     - Default top_k       : 5
+     - Scoring             : Pairwise (query, chunk_text), sorted descending
+
+9. openai/gpt-oss-120b (LLM - Metadata Filter Extraction)
+--------------------------------------------------------------------------------
+   Purpose       : Parses user queries to extract metadata filters (pages, labels)
+   Size          : 120 Billion parameters
+   Type          : Large Language Model (via Groq API)
+   Used in       : query.py (extract_metadata_filters function)
+   Configuration :
+     - temperature         : 0.0
+     - response_format     : json_object
+     - Extracts: page_nos, labels, filename from natural language queries
+
+10. openai/gpt-oss-120b (LLM - Answer Generation)
+--------------------------------------------------------------------------------
+    Purpose       : Generates final RAG answers from retrieved context
+    Size          : 120 Billion parameters
+    Type          : Large Language Model (via Groq API)
+    Used in       : generate.py (generate_answer function)
+    Configuration :
+      - temperature         : 0.2
+      - max_tokens          : 1024
+      - System prompt       : Document QA with page citations
+
+11. openai/gpt-oss-120b (LLM - Agentic Reasoning)
+--------------------------------------------------------------------------------
+    Purpose       : Agent reasoning, tool selection, multi-step planning
+    Size          : 120 Billion parameters
+    Type          : Large Language Model (via Groq API + LangChain ChatGroq)
+    Used in       : agentic_rag/agent.py
+    Configuration :
+      - temperature         : 0.0
+      - Wrapper             : LangChain ChatGroq
+
+
+================================================================================
+                    QDRANT VECTOR DATABASE CONFIGURATION
+================================================================================
+
+   Host                    : localhost (configurable via QDRANT_HOST env var)
+   Port                    : 6333 (configurable via QDRANT_PORT env var)
+
+   Dense Vector Config:
+     - Name                : "dense"
+     - Dimensions          : 1024
+     - Distance Metric     : COSINE
+
+   Sparse Vector Config:
+     - Name                : "sparse"
+     - Dimensions          : Variable (sparse index/value pairs)
+     - Modifier            : IDF (BM25 scoring)
+
+   Fusion Strategy         : RRF (Reciprocal Rank Fusion, server-side)
+   Prefetch Limit          : 40 candidates per arm (dense + sparse)
+   RRF Candidate Pool      : 25 (fused candidates before reranking)
+
+   Payload Indexes:
+     - pages               : INTEGER
+     - labels              : KEYWORD
+     - filename            : KEYWORD
+
+
+================================================================================
+                         CHUNKING CONFIGURATION
+================================================================================
+
+   Chunker Type            : HybridChunker (Docling)
+   Tokenizer               : BAAI/bge-m3 (HuggingFace AutoTokenizer)
+   Max Tokens per Chunk    : 512
+   merge_peers             : True (merge small neighboring chunks)
+   merge_list_items        : True (keep bullet-point lists together)
+
+
+================================================================================
+                         PIPELINE FLOW SUMMARY
+================================================================================
+
+INGESTION:
+  PDF
+   |-> EasyOCR (text extraction from scanned regions)
+   |-> Qwen2.5-VL-3B-Instruct (image/chart descriptions)
+   |-> TableFormer (table structure extraction)
+   |-> HybridChunker (512 tokens, bge-m3 tokenizer)
+   |-> BAAI/bge-m3 (dense embeddings, 1024-dim, COSINE)
+   |-> Qdrant/bm25 (sparse embeddings, IDF modifier)
+   |-> Qdrant Vector DB (dual-vector collection)
+
+RETRIEVAL:
+  User Query
+   |-> openai/gpt-oss-120b (metadata filter extraction)
+   |-> BAAI/bge-m3 (query dense encoding, 1024-dim)
+   |-> Qdrant/bm25 (query sparse encoding)
+   |-> Qdrant Hybrid Search (RRF fusion, 25 candidates)
+   |-> cross-encoder/ms-marco-MiniLM-L-6-v2 (reranking, top 5)
+   |-> openai/gpt-oss-120b (answer generation, temp=0.2)
+
+AGENTIC LAYER:
+  User Input
+   |-> openai/gpt-oss-120b (agent reasoning + tool selection)
+   |-> Tools: search_knowledge_base, calculator, web_search (DuckDuckGo)
+
+================================================================================

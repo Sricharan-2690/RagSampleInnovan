@@ -9,6 +9,7 @@ Hybrid Chunking, Embedding generation, and Qdrant storage.
 import os
 import sys
 from pathlib import Path
+from langsmith import Client
 
 # Disable Hugging Face symlinks & PyTorch Dynamo/Inductor JIT compilers on Windows
 os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
@@ -68,6 +69,13 @@ def ingest_uploaded_pdf(uploaded_file) -> str:
     collection_name = run_storage()
 
     print(f"[IngestAdapter] Ingestion complete. Collection: '{collection_name}'")
+
+    # Flush LangSmith traces so runs don't stay in "running" state
+    try:
+        Client().flush()
+    except Exception:
+        pass
+
     return collection_name
 
 
@@ -93,4 +101,11 @@ def ingest_local_pdf(pdf_path: Path) -> str:
     run_parsing(pdf_path=pdf_path)
     run_chunking()
     collection_name = run_storage()
+
+    # Flush LangSmith traces
+    try:
+        Client().flush()
+    except Exception:
+        pass
+
     return collection_name
