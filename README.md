@@ -48,7 +48,7 @@ c:\TASKS\T2\AgenticRAG\
 ├── Parsing-main/                    # Teammate's Ingestion & Retrieval Pipeline
 │   ├── parse.py                     # Stage 1: Docling OCR, table extraction, VLM image descriptions
 │   ├── chunking.py                  # Stage 2: HybridChunker (512 tokens with heading context)
-│   ├── store_qdrant.py              # Stage 3: Dense (bge-small) + Sparse (BM25) vector storage
+│   ├── store_qdrant.py              # Stage 3: Dense (bge-m3) + Sparse (BM25) vector storage
 │   ├── pipeline.py                  # Orchestrator for stages 1-3
 │   ├── query.py                     # Hybrid vector search + RRF + Cross-encoder reranker
 │   └── requirements.txt
@@ -80,11 +80,11 @@ c:\TASKS\T2\AgenticRAG\
    - Uses `Qwen2.5-VL-3B-Instruct` VLM to generate factual text descriptions of charts and images.
    - Outputs `sample_doc.pkl`, `result.md`, and `result.json`.
 4. **[Parsing-main/chunking.py](file:///c:/TASKS/T2/AgenticRAG/Parsing-main/chunking.py)**:
-   - Uses Docling `HybridChunker` tokenized with `BAAI/bge-small-en-v1.5` (max 512 tokens).
+   - Uses Docling `HybridChunker` tokenized with `BAAI/bge-m3` (max 512 tokens).
    - Prepends section heading hierarchies to each chunk via `chunker.contextualize()`.
    - Extracts metadata: `headings`, `pages`, `labels`, `filename`.
 5. **[Parsing-main/store_qdrant.py](file:///c:/TASKS/T2/AgenticRAG/Parsing-main/store_qdrant.py)**:
-   - Generates **Dense vectors** (`BAAI/bge-small-en-v1.5`, 384 dimensions, Cosine distance).
+   - Generates **Dense vectors** (`BAAI/bge-m3`, 1024 dimensions, Cosine distance).
    - Generates **Sparse vectors** (`Qdrant/bm25` FastEmbed with `Modifier.IDF`).
    - Sanitizes PDF filename into a clean Qdrant collection name (e.g. `resume_ggl`).
    - Creates payload indexes for `pages`, `labels`, and `filename`, and upserts points.
@@ -95,7 +95,7 @@ c:\TASKS\T2\AgenticRAG\
 
 1. **[app.py](file:///c:/TASKS/T2/AgenticRAG/app.py)**: User inputs a message in the chat input box. Passes the prompt to `runner.run()`.
 2. **[agentic_rag/executor.py](file:///c:/TASKS/T2/AgenticRAG/agentic_rag/executor.py)**: `RAGAgentRunner` invokes `AgentExecutor` with `return_intermediate_steps=True`.
-3. **[agentic_rag/agent.py](file:///c:/TASKS/T2/AgenticRAG/agentic_rag/agent.py)**: Configures **ChatGroq LLM** (`llama-3.3-70b-versatile`) and system prompt guardrails. The agent evaluates the question and selects a tool:
+3. **[agentic_rag/agent.py](file:///c:/TASKS/T2/AgenticRAG/agentic_rag/agent.py)**: Configures **ChatGroq LLM** (`openai/gpt-oss-120b`) and system prompt guardrails. The agent evaluates the question and selects a tool:
    - Document question ➔ Calls `search_knowledge_base`
    - Math calculation ➔ Calls `calculator_tool`
    - External web query ➔ Calls `web_search_tool`
@@ -110,10 +110,10 @@ c:\TASKS\T2\AgenticRAG\
 
 ### Dense vs. Sparse Hybrid Search
 
-| Feature | Dense Vector (`bge-small-en-v1.5`) | Sparse Vector (`Qdrant/bm25`) |
+| Feature | Dense Vector (`bge-m3`) | Sparse Vector (`Qdrant/bm25`) |
 | :--- | :--- | :--- |
 | **What it captures** | **Semantic Meaning & Synonyms** | **Exact Keywords, Names, & Numbers** |
-| **Data Structure** | 384 floating-point numbers | High-dimensional dictionary of token weights |
+| **Data Structure** | 1024 floating-point numbers | High-dimensional dictionary of token weights |
 | **Example Match** | *"vacation"* matching *"time off"* | *"ERR-404-X"* matching *"ERR-404-X"* |
 
 * **Reciprocal Rank Fusion (RRF)**: Qdrant merges dense and sparse ranked candidate pools server-side.
@@ -146,7 +146,7 @@ c:\TASKS\T2\AgenticRAG\
 ### Documentation
 * **`models_summary.txt`**: Added a complete inventory of every model used across the ingestion and retrieval pipelines — embedding model (`BAAI/bge-m3`, 1024-dim, COSINE), sparse `Qdrant/bm25` (IDF), cross-encoder reranker (`ms-marco-MiniLM-L-6-v2`), VLM (`Qwen2.5-VL-3B-Instruct`), EasyOCR, TableFormer, and the `openai/gpt-oss-120b` LLM — along with sizes, vector dimensions, distance metrics, and Qdrant configuration.
 
-> Note: the current pipeline uses `BAAI/bge-m3` (1024-dim dense vectors) and `openai/gpt-oss-120b`. Some older sections of this README still reference `bge-small` (384-dim) and `llama-3.3-70b`; see `models_summary.txt` for the authoritative, up-to-date list.
+* **Model references updated**: All sections of this README now reflect the current pipeline — `BAAI/bge-m3` (1024-dim dense vectors, Cosine) and `openai/gpt-oss-120b` — replacing the earlier `bge-small` (384-dim) and `llama-3.3-70b` references. See `models_summary.txt` for the authoritative, up-to-date list.
 
 ---
 
